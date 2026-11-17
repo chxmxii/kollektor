@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kollektor-agent
+  labels:
+    app.kubernetes.io/name: kollektor-agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kollektor-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kollektor-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: kollektor-agent
+      hostPID: true # /proc must show host PIDs to map processes to containers
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: agent
+          image: kollektor-agent
+          imagePullPolicy: IfNotPresent
+          args:
+            - -probes=exec
+            - -log-level=info
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: metrics
+              containerPort: 9090
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            # CAP_BPF + CAP_PERFMON need kernel >= 5.8; on older kernels
+            # switch to privileged: true.
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["BPF", "PERFMON", "SYS_RESOURCE"]
+            seccompProfile:
+              type: Unconfined

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kollektor
+  labels:
+    # The agent needs hostPID and BPF capabilities.
+    pod-security.kubernetes.io/enforce: privileged
