@@ -7,17 +7,18 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 
-# --- build: generate BPF bindings and compile a static agent binary ---------
+# --- build: generate BPF bindings and compile a static binary ----------------
 FROM bpf-builder AS build
+ARG VERSION=dev
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN go generate ./... \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/kollektor-agent ./cmd/kollektor-agent
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/kollektor ./cmd/kollektor
 
 # --- runtime -----------------------------------------------------------------
-# Runs as root: loading BPF needs CAP_BPF/CAP_PERFMON in the effective set,
-# which non-root users don't get from securityContext capabilities alone.
+# The image is what node-collection pods will run. They need root: loading BPF
+# requires CAP_BPF/CAP_PERFMON in the effective set.
 FROM gcr.io/distroless/static-debian12
-COPY --from=build /out/kollektor-agent /kollektor-agent
-ENTRYPOINT ["/kollektor-agent"]
+COPY --from=build /out/kollektor /kollektor
+ENTRYPOINT ["/kollektor"]

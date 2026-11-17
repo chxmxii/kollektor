@@ -1,11 +1,16 @@
-IMAGE          ?= ghcr.io/chxmxii/kollektor-agent
-TAG            ?= dev
+VERSION        ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+IMAGE          ?= ghcr.io/chxmxii/kollektor
 CONTAINER_TOOL ?= $(shell command -v docker 2>/dev/null || command -v podman 2>/dev/null)
-KIND_CLUSTER   ?= kind
 BUILDER_IMAGE  := kollektor-bpf-builder
+LDFLAGS        := -s -w -X main.version=$(VERSION)
 
 .PHONY: all
-all: generate build
+all: build
+
+## build: build bin/kollektor (static)
+.PHONY: build
+build:
+	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/kollektor ./cmd/kollektor
 
 ## generate: compile BPF C into Go bindings (uses local clang, else a builder container)
 .PHONY: generate
@@ -19,11 +24,6 @@ else
 		$(BUILDER_IMAGE) go generate ./...
 endif
 
-## build: build the agent binary into bin/
-.PHONY: build
-build:
-	CGO_ENABLED=0 go build -trimpath -o bin/kollektor-agent ./cmd/kollektor-agent
-
 ## test: run unit tests
 .PHONY: test
 test:
@@ -35,32 +35,10 @@ lint:
 	go vet ./...
 	@test -z "$$(gofmt -l .)" || (gofmt -l .; exit 1)
 
-## run: run the agent locally without k8s enrichment (needs root)
-.PHONY: run
-run: build
-	sudo ./bin/kollektor-agent -k8s=false -log-events
-
-## image: build the container image
+## image: build the container image (used for node collection)
 .PHONY: image
 image:
-	$(CONTAINER_TOOL) build -t $(IMAGE):$(TAG) .
-
-## kind-load: load the image into a kind cluster
-.PHONY: kind-load
-kind-load: image
-	mkdir -p bin
-	$(CONTAINER_TOOL) save $(IMAGE):$(TAG) -o bin/image.tar
-	kind load image-archive bin/image.tar --name $(KIND_CLUSTER)
-
-## deploy: apply the manifests to the current kube context
-.PHONY: deploy
-deploy:
-	kubectl apply -k deploy/base
-
-## undeploy: remove the manifests
-.PHONY: undeploy
-undeploy:
-	kubectl delete -k deploy/base --ignore-not-found
+	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) .
 
 ## clean: remove build output
 .PHONY: clean
