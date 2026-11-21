@@ -23,6 +23,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/yaml"
 
 	"github.com/chxmxii/kollektor/internal/archive"
@@ -42,6 +43,7 @@ type Options struct {
 	LogSince       time.Duration // 0 = full log
 	Concurrency    int
 	ToolVersion    string
+	Node           NodeOptions
 }
 
 // skipResources are listable but useless or duplicated as evidence.
@@ -51,15 +53,23 @@ var skipResources = map[schema.GroupResource]bool{
 }
 
 type collector struct {
-	opts Options
-	log  *slog.Logger
-	cs   kubernetes.Interface
-	dyn  dynamic.Interface
-	out  *archive.Writer
+	opts       Options
+	log        *slog.Logger
+	restConfig *rest.Config
+	cs         kubernetes.Interface
+	dyn        dynamic.Interface
+	out        *archive.Writer
 
-	mu   sync.Mutex
-	pods []corev1.Pod
-	objs int
+	mu        sync.Mutex
+	pods      []corev1.Pod
+	objs      int
+	footprint []string
+}
+
+func (c *collector) addFootprint(format string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.footprint = append(c.footprint, time.Now().UTC().Format(time.RFC3339)+" "+fmt.Sprintf(format, args...))
 }
 
 // Run performs a full collection and returns the archive path and manifest.
@@ -90,7 +100,7 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (string, *archive.
 	if err != nil {
 		return "", nil, err
 	}
-	c := &collector{opts: opts, log: log, cs: cs, dyn: dyn, out: out}
+	c := &collector{opts: opts, log: log, restConfig: target.Config, cs: cs, dyn: dyn, out: out}
 
 	meta := archive.Metadata{
 		ToolVersion: opts.ToolVersion,
@@ -117,6 +127,10 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (string, *archive.
 		return "", nil, err
 	}
 	log.Info("resources collected", "objects", c.objs, "pods", len(c.pods))
+	if err := c.writeContainerIndex(); err != nil {
+		out.Abort()
+		return "", nil, err
+	}
 
 	if opts.Logs {
 		if err := c.collectLogs(ctx); err != nil {
@@ -125,6 +139,13 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) (string, *archive.
 		}
 	}
 
+	// Nodes last: the collection pods must not show up in cluster/.
+	if err := c.collectNodes(ctx); err != nil {
+		out.Abort()
+		return "", nil, err
+	}
+
+	meta.Footprint = c.footprint
 	meta.Finished = time.Now().UTC()
 	m, err := out.Close(meta)
 	return opts.Output, m, err
@@ -304,4 +325,47 @@ func safeName(s string) string {
 		}
 		return '_'
 	}, s)
+}
+
+// ContainerRef maps a container ID (as seen in node cgroups and traces) to
+// its pod.
+type ContainerRef struct {
+	Namespace string `json:"namespace"`
+	Pod       string `json:"pod"`
+	PodUID    string `json:"podUid"`
+	Container string `json:"container"`
+	Node      string `json:"node"`
+	Image     string `json:"image"`
+	ImageID   string `json:"imageId"`
+}
+
+// writeContainerIndex writes cluster/container-index.json: container ID →
+// pod, for the current and previous instance of every container.
+func (c *collector) writeContainerIndex() error {
+	idx := map[string]ContainerRef{}
+	for _, p := range c.pods {
+		for _, st := range allStatuses(&p) {
+			ref := ContainerRef{
+				Namespace: p.Namespace, Pod: p.Name, PodUID: string(p.UID), Container: st.Name,
+				Node: p.Spec.NodeName, Image: st.Image, ImageID: st.ImageID,
+			}
+			if id := stripRuntime(st.ContainerID); id != "" {
+				idx[id] = ref
+			}
+			if t := st.LastTerminationState.Terminated; t != nil {
+				if id := stripRuntime(t.ContainerID); id != "" {
+					idx[id] = ref
+				}
+			}
+		}
+	}
+	return c.writeJSON("cluster/container-index.json", idx)
+}
+
+// stripRuntime turns "containerd://abc" into "abc".
+func stripRuntime(id string) string {
+	if _, after, ok := strings.Cut(id, "://"); ok {
+		return after
+	}
+	return id
 }

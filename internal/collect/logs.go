@@ -119,7 +119,8 @@ func (c *collector) fetchLog(ctx context.Context, spool string, j logJob) error 
 			return err
 		}
 	}
-	return c.out.WriteFrom(path.Join("logs", id), tmp, size)
+	_, err = c.out.WriteFrom(path.Join("logs", id), tmp, size)
+	return err
 }
 
 func allStatuses(p *corev1.Pod) []corev1.ContainerStatus {

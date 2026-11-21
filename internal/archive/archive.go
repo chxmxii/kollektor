@@ -45,13 +45,16 @@ type Metadata struct {
 	Command       []string  `json:"command"`
 	Host          string    `json:"host"`
 	OSUser        string    `json:"osUser"`
-	KubeContext   string    `json:"kubeContext"`
-	KubeServer    string    `json:"kubeServer"`
+	KubeContext   string    `json:"kubeContext,omitempty"`
+	KubeServer    string    `json:"kubeServer,omitempty"`
 	KubeUser      string    `json:"kubeUser,omitempty"`
 	KubeGroups    []string  `json:"kubeGroups,omitempty"`
 	ServerVersion string    `json:"serverVersion,omitempty"`
 	Namespaces    []string  `json:"namespaces,omitempty"` // empty = all
 	SecretsRaw    bool      `json:"secretsRaw"`
+	// Footprint lists every change kollektor made to the system it
+	// collected from (e.g. collection pods it created), for chain of custody.
+	Footprint []string `json:"footprint,omitempty"`
 }
 
 // Manifest is the content of manifest.json.
@@ -67,12 +70,11 @@ type Manifest struct {
 
 // Writer streams files into an archive. It is safe for concurrent use.
 type Writer struct {
-	path  string
 	root  string
 	mtime time.Time
+	f     *os.File // set when writing to a file created by Create
 
 	mu     sync.Mutex
-	f      *os.File
 	zw     *zstd.Encoder
 	tw     *tar.Writer
 	files  []Entry
@@ -80,43 +82,57 @@ type Writer struct {
 	closed bool
 }
 
-// Create creates a new archive at path. Entries are stored under a root
+// Create creates a new archive file at p. Entries are stored under a root
 // directory named after the file (without extension).
 func Create(p string) (*Writer, error) {
 	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	zw, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
+	w, err := NewWriter(f, rootName(p))
 	if err != nil {
 		f.Close()
+		os.Remove(p)
 		return nil, err
 	}
-	return &Writer{
-		path:  p,
-		root:  rootName(p),
-		mtime: time.Now().UTC(),
-		f:     f,
-		zw:    zw,
-		tw:    tar.NewWriter(zw),
-	}, nil
+	w.f = f
+	return w, nil
+}
+
+// NewWriter writes an archive to out, with entries stored under root.
+func NewWriter(out io.Writer, root string) (*Writer, error) {
+	zw, err := zstd.NewWriter(out, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
+	if err != nil {
+		return nil, err
+	}
+	return &Writer{root: root, mtime: time.Now().UTC(), zw: zw, tw: tar.NewWriter(zw)}, nil
 }
 
 // WriteFile adds a file with the given content.
 func (w *Writer) WriteFile(name string, data []byte) error {
-	return w.WriteFrom(name, bytes.NewReader(data), int64(len(data)))
+	_, err := w.WriteFrom(name, bytes.NewReader(data), int64(len(data)))
+	return err
+}
+
+// WriteJSON adds a file containing v as indented JSON.
+func (w *Writer) WriteJSON(name string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return w.WriteFile(name, data)
 }
 
 // WriteFrom adds a file of exactly size bytes read from r.
-func (w *Writer) WriteFrom(name string, r io.Reader, size int64) error {
+func (w *Writer) WriteFrom(name string, r io.Reader, size int64) (Entry, error) {
 	name, err := cleanName(name)
 	if err != nil {
-		return err
+		return Entry{}, err
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
-		return errors.New("archive is closed")
+		return Entry{}, errors.New("archive is closed")
 	}
 	hdr := &tar.Header{
 		Name:     path.Join(w.root, name),
@@ -127,18 +143,19 @@ func (w *Writer) WriteFrom(name string, r io.Reader, size int64) error {
 		Format:   tar.FormatPAX,
 	}
 	if err := w.tw.WriteHeader(hdr); err != nil {
-		return err
+		return Entry{}, err
 	}
 	h := sha256.New()
 	n, err := io.Copy(w.tw, io.TeeReader(io.LimitReader(r, size), h))
 	if err != nil {
-		return err
+		return Entry{}, err
 	}
 	if n != size {
-		return fmt.Errorf("%s: wrote %d bytes, expected %d", name, n, size)
+		return Entry{}, fmt.Errorf("%s: wrote %d bytes, expected %d", name, n, size)
 	}
-	w.files = append(w.files, Entry{Path: name, Size: size, SHA256: hex.EncodeToString(h.Sum(nil))})
-	return nil
+	e := Entry{Path: name, Size: size, SHA256: hex.EncodeToString(h.Sum(nil))}
+	w.files = append(w.files, e)
+	return e, nil
 }
 
 // RecordError notes something that could not be collected.
@@ -154,27 +171,28 @@ func (w *Writer) Close(meta Metadata) (*Manifest, error) {
 	m := &Manifest{Format: Format, Metadata: meta, Errors: w.errs, Files: w.files}
 	w.mu.Unlock()
 
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	if err := w.WriteFile(ManifestName, data); err != nil {
+	if err := w.WriteJSON(ManifestName, m); err != nil {
 		return nil, err
 	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.closed = true
-	err = errors.Join(w.tw.Close(), w.zw.Close(), w.f.Sync(), w.f.Close())
-	if err != nil {
+	if err := errors.Join(w.tw.Close(), w.zw.Close()); err != nil {
 		return nil, err
 	}
-	// Archives are evidence: make the result read-only.
-	_ = os.Chmod(w.path, 0o400)
+	if w.f != nil {
+		if err := errors.Join(w.f.Sync(), w.f.Close()); err != nil {
+			return nil, err
+		}
+		// Archives are evidence: make the result read-only.
+		_ = os.Chmod(w.f.Name(), 0o400)
+	}
 	return m, nil
 }
 
-// Abort closes and deletes a partially written archive.
+// Abort closes the archive without a manifest and, for file archives,
+// deletes the partial file.
 func (w *Writer) Abort() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -184,19 +202,29 @@ func (w *Writer) Abort() {
 	w.closed = true
 	_ = w.tw.Close()
 	_ = w.zw.Close()
-	_ = w.f.Close()
-	_ = os.Remove(w.path)
+	if w.f != nil {
+		_ = w.f.Close()
+		_ = os.Remove(w.f.Name())
+	}
 }
 
-// Walk calls fn for every regular file in the archive, in order, with its
-// path relative to the archive root. fn must not retain r.
-func Walk(p string, fn func(name string, r io.Reader) error) error {
+// WalkFunc receives each regular file with its path relative to the archive
+// root. It must not retain r.
+type WalkFunc func(name string, size int64, r io.Reader) error
+
+// Walk calls fn for every regular file in the archive file at p, in order.
+func Walk(p string, fn WalkFunc) error {
 	f, err := os.Open(p)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	zr, err := zstd.NewReader(f)
+	return WalkReader(f, fn)
+}
+
+// WalkReader calls fn for every regular file in an archive stream.
+func WalkReader(r io.Reader, fn WalkFunc) error {
+	zr, err := zstd.NewReader(r)
 	if err != nil {
 		return err
 	}
@@ -218,7 +246,7 @@ func Walk(p string, fn func(name string, r io.Reader) error) error {
 		if !ok {
 			continue
 		}
-		if err := fn(rel, tr); err != nil {
+		if err := fn(rel, hdr.Size, tr); err != nil {
 			return err
 		}
 	}
@@ -236,7 +264,7 @@ type VerifyResult struct {
 func Verify(p string) (*VerifyResult, error) {
 	seen := map[string]Entry{}
 	var manifest *Manifest
-	err := Walk(p, func(name string, r io.Reader) error {
+	err := Walk(p, func(name string, _ int64, r io.Reader) error {
 		if name == ManifestName {
 			manifest = &Manifest{}
 			return json.NewDecoder(r).Decode(manifest)
@@ -255,49 +283,48 @@ func Verify(p string) (*VerifyResult, error) {
 	if manifest == nil {
 		return nil, errors.New("archive has no manifest.json (truncated or not a kollektor archive)")
 	}
-
 	res := &VerifyResult{Manifest: manifest}
-	for _, want := range manifest.Files {
-		got, ok := seen[want.Path]
-		switch {
-		case !ok:
-			res.Problems = append(res.Problems, "missing: "+want.Path)
-		case got.SHA256 != want.SHA256 || got.Size != want.Size:
-			res.Problems = append(res.Problems, "hash mismatch: "+want.Path)
-		default:
-			res.Verified++
-		}
-		delete(seen, want.Path)
-	}
-	for name := range seen {
-		res.Problems = append(res.Problems, "not in manifest: "+name)
-	}
+	res.Verified, res.Problems = Compare(manifest.Files, seen)
 	return res, nil
 }
 
-func rootName(p string) string {
-	base := path.Base(strings.ReplaceAll(p, "\\", "/"))
-	for _, ext := range []string{".tar.zst", ".tzst", ".zst", ".tar"} {
-		if strings.HasSuffix(base, ext) {
-			return strings.TrimSuffix(base, ext)
+// Compare checks the files actually seen against the manifest's list and
+// returns how many matched and a description of every discrepancy.
+func Compare(want []Entry, seen map[string]Entry) (int, []string) {
+	seen = maps(seen)
+	ok := 0
+	var problems []string
+	for _, w := range want {
+		got, found := seen[w.Path]
+		switch {
+		case !found:
+			problems = append(problems, "missing: "+w.Path)
+		case got.SHA256 != w.SHA256 || got.Size != w.Size:
+			problems = append(problems, "hash mismatch: "+w.Path)
+		default:
+			ok++
 		}
+		delete(seen, w.Path)
 	}
-	return base
+	for name := range seen {
+		problems = append(problems, "not in manifest: "+name)
+	}
+	return ok, problems
 }
 
-func cleanName(name string) (string, error) {
-	c := path.Clean(name)
-	if c == "." || path.IsAbs(c) || c == ".." || strings.HasPrefix(c, "../") {
-		return "", fmt.Errorf("invalid archive path %q", name)
+func maps(m map[string]Entry) map[string]Entry {
+	c := make(map[string]Entry, len(m))
+	for k, v := range m {
+		c[k] = v
 	}
-	return c, nil
+	return c
 }
 
 // Extract writes every file in the archive below dir. Paths are validated so
 // a crafted archive cannot write outside dir.
 func Extract(p, dir string) (int, error) {
 	n := 0
-	err := Walk(p, func(name string, r io.Reader) error {
+	err := Walk(p, func(name string, _ int64, r io.Reader) error {
 		clean, err := cleanName(name)
 		if err != nil {
 			return err
@@ -318,4 +345,22 @@ func Extract(p, dir string) (int, error) {
 		return f.Close()
 	})
 	return n, err
+}
+
+func rootName(p string) string {
+	base := path.Base(strings.ReplaceAll(p, "\\", "/"))
+	for _, ext := range []string{".tar.zst", ".tzst", ".zst", ".tar"} {
+		if strings.HasSuffix(base, ext) {
+			return strings.TrimSuffix(base, ext)
+		}
+	}
+	return base
+}
+
+func cleanName(name string) (string, error) {
+	c := path.Clean(name)
+	if c == "." || path.IsAbs(c) || c == ".." || strings.HasPrefix(c, "../") {
+		return "", fmt.Errorf("invalid archive path %q", name)
+	}
+	return c, nil
 }

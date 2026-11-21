@@ -105,7 +105,7 @@ var kindOrder = map[string]int{
 // Load reads every object under cluster/ in the archive.
 func Load(archivePath string) ([]*unstructured.Unstructured, error) {
 	var objs []*unstructured.Unstructured
-	err := archive.Walk(archivePath, func(name string, r io.Reader) error {
+	err := archive.Walk(archivePath, func(name string, _ int64, r io.Reader) error {
 		if !strings.HasPrefix(name, "cluster/") || !strings.HasSuffix(name, ".yaml") {
 			return nil
 		}

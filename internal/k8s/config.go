@@ -1,5 +1,4 @@
-// Package k8s holds Kubernetes client helpers and the PID → pod resolver
-// used by node-level collection.
+// Package k8s holds Kubernetes client helpers.
 package k8s
 
 import (

@@ -33,7 +33,7 @@ func TestRoundTripAndVerify(t *testing.T) {
 	}
 
 	got := map[string]string{}
-	err = Walk(p, func(name string, r io.Reader) error {
+	err = Walk(p, func(name string, _ int64, r io.Reader) error {
 		b, err := io.ReadAll(r)
 		got[name] = string(b)
 		return err
@@ -74,7 +74,7 @@ func TestVerifyDetectsTampering(t *testing.T) {
 	// Rewrite the archive with modified content but the original manifest.
 	tampered := filepath.Join(dir, "case-t.tar.zst")
 	tw, _ := Create(tampered)
-	_ = Walk(p, func(name string, r io.Reader) error {
+	_ = Walk(p, func(name string, _ int64, r io.Reader) error {
 		b, _ := io.ReadAll(r)
 		if name == "logs/x.log" {
 			b = []byte("modified evidence")

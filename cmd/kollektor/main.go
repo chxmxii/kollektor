@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/chxmxii/kollektor/internal/archive"
 	"github.com/chxmxii/kollektor/internal/collect"
+	"github.com/chxmxii/kollektor/internal/node"
 	"github.com/chxmxii/kollektor/internal/replay"
 )
 
@@ -55,6 +57,10 @@ func main() {
 		err = runExtract(args)
 	case "replay":
 		err = runReplay(ctx, args)
+	case "node": // hidden: runs inside a collection pod
+		err = runNode(ctx, args)
+	case "idle": // hidden: keeps a collection pod alive when using --image
+		<-ctx.Done()
 	case "version", "--version":
 		fmt.Println(version)
 	case "help", "-h", "--help":
@@ -92,7 +98,12 @@ func runCollect(ctx context.Context, args []string) error {
 	fs.BoolVar(&o.IncludeSecrets, "include-secrets", false, "store raw Secret values (default: replace values with SHA-256 hashes)")
 	fs.BoolVar(&o.Logs, "logs", true, "collect container logs")
 	fs.DurationVar(&o.LogSince, "log-since", 0, "only collect logs newer than this (e.g. 24h; default full log)")
-	fs.IntVar(&o.Concurrency, "concurrency", 8, "parallel API requests")
+	fs.IntVar(&o.Concurrency, "concurrency", 8, "parallel API requests and node collections")
+	fs.StringVar(&o.Node.Nodes, "nodes", "all", `nodes to collect host evidence from: "all", "none", or comma-separated names`)
+	fs.DurationVar(&o.Node.TraceDuration, "trace-duration", 30*time.Second, "eBPF capture window on each node (0 disables tracing)")
+	fs.StringVar(&o.Node.Namespace, "node-namespace", "kollektor", "namespace for temporary collection pods (created and deleted if missing)")
+	fs.StringVar(&o.Node.Image, "image", "", "image containing /kollektor for node pods (default: upload this binary)")
+	fs.StringVar(&o.Node.HelperImage, "helper-image", "busybox:1.36", "image with sh/cat/sleep used when uploading this binary")
 	fs.BoolVar(&verbose, "v", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -111,6 +122,31 @@ func runCollect(ctx context.Context, args []string) error {
 	fmt.Fprintf(os.Stderr, "\nwrote %s: %d files, %s uncompressed, %d collection errors (see manifest.json)\n",
 		out, len(m.Files), humanBytes(size), len(m.Errors))
 	return nil
+}
+
+func runNode(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("node", flag.ContinueOnError)
+	var o node.Options
+	fs.StringVar(&o.HostRoot, "host-root", "/host", "node root filesystem mount")
+	fs.StringVar(&o.ProcRoot, "proc-root", "/proc", "procfs with host PIDs")
+	fs.StringVar(&o.CgroupRoot, "cgroup-root", "/sys/fs/cgroup", "host cgroup v2 mount, for attributing trace events")
+	fs.DurationVar(&o.TraceDuration, "trace-duration", 30*time.Second, "eBPF capture window (0 disables)")
+	fs.BoolVar(&o.IncludeSecrets, "include-secrets", false, "keep private keys, tokens and environment values")
+	fs.StringVar(&o.ToolVersion, "tool-version", version, "version of the orchestrating kollektor")
+	out := fs.String("o", "-", `output archive ("-" = stdout)`)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	w := io.Writer(os.Stdout)
+	if *out != "-" {
+		f, err := os.OpenFile(*out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		w = f
+	}
+	return node.Run(ctx, o, w, newLogger(false))
 }
 
 func runInspect(args []string) error {
@@ -140,12 +176,22 @@ func runInspect(args []string) error {
 	if md.SecretsRaw {
 		secrets = "RAW VALUES"
 	}
-	fmt.Printf("namespaces:  %s\nsecrets:     %s\n\n", ns, secrets)
+	fmt.Printf("namespaces:  %s\nsecrets:     %s\n", ns, secrets)
+	if len(md.Footprint) > 0 {
+		fmt.Println("footprint (changes kollektor made to the cluster):")
+		for _, f := range md.Footprint {
+			fmt.Println("  -", f)
+		}
+	}
+	fmt.Println()
 
 	sections := map[string]int{}
 	var resources = map[string]int{}
 	for _, f := range m.Files {
-		top, rest, _ := strings.Cut(f.Path, "/")
+		top, rest, isDir := strings.Cut(f.Path, "/")
+		if isDir {
+			top += "/"
+		}
 		sections[top]++
 		if top == "cluster" {
 			if parts := strings.Split(rest, "/"); len(parts) == 3 {
@@ -155,11 +201,24 @@ func runInspect(args []string) error {
 	}
 	fmt.Println("contents:")
 	for _, k := range sortedKeys(sections) {
-		fmt.Printf("  %-10s %d files\n", k+"/", sections[k])
+		fmt.Printf("  %-16s %d files\n", k, sections[k])
 	}
-	fmt.Println("\nobjects by resource:")
-	for _, k := range sortedKeys(resources) {
-		fmt.Printf("  %6d  %s\n", resources[k], k)
+	if len(resources) > 0 {
+		fmt.Println("\nobjects by resource:")
+		for _, k := range sortedKeys(resources) {
+			fmt.Printf("  %6d  %s\n", resources[k], k)
+		}
+	}
+	var nodes []string
+	for _, f := range m.Files {
+		if n, ok := strings.CutPrefix(f.Path, "nodes/"); ok {
+			if name, rest, _ := strings.Cut(n, "/"); rest == archive.ManifestName {
+				nodes = append(nodes, name)
+			}
+		}
+	}
+	if len(nodes) > 0 {
+		fmt.Printf("\nnodes collected: %s\n", strings.Join(nodes, ", "))
 	}
 
 	if len(m.Errors) > 0 {

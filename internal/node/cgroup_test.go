@@ -1,4 +1,4 @@
-package k8s
+package node
 
 import (
 	"os"
@@ -24,7 +24,7 @@ func TestContainerIDForPID(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(root, "42", "cgroup"), []byte(content), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			got, err := NewResolver(nil, root).containerIDForPID(42)
+			got, err := containerIDForPID(root, 42)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -36,18 +36,5 @@ func TestContainerIDForPID(t *testing.T) {
 				t.Errorf("got %q, want %q", got, want)
 			}
 		})
-	}
-}
-
-func TestStripRuntime(t *testing.T) {
-	for in, want := range map[string]string{
-		"containerd://abc": "abc",
-		"cri-o://abc":      "abc",
-		"abc":              "abc",
-		"":                 "",
-	} {
-		if got := stripRuntime(in); got != want {
-			t.Errorf("stripRuntime(%q) = %q, want %q", in, got, want)
-		}
 	}
 }

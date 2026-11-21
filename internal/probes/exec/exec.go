@@ -13,6 +13,7 @@ import (
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"golang.org/x/sys/unix"
 
 	"github.com/chxmxii/kollektor/internal/events"
 )
@@ -59,6 +60,10 @@ func (p *Probe) Run(ctx context.Context, out chan<- events.Event) error {
 	}()
 
 	p.log.Info("probe attached")
+	clock, err := newMonoClock()
+	if err != nil {
+		return err
+	}
 
 	var raw bpfExecEvent
 	for {
@@ -76,7 +81,7 @@ func (p *Probe) Run(ctx context.Context, out chan<- events.Event) error {
 
 		ev := events.Event{
 			Type:     events.TypeExec,
-			Time:     time.Now(), // TODO: convert raw.KtimeNs to wall clock via boot-time offset.
+			Time:     clock.wall(raw.KtimeNs),
 			PID:      raw.Tgid,
 			TID:      raw.Pid,
 			UID:      raw.Uid,
@@ -90,6 +95,22 @@ func (p *Probe) Run(ctx context.Context, out chan<- events.Event) error {
 			return nil
 		}
 	}
+}
+
+// monoClock converts bpf_ktime_get_ns() (CLOCK_MONOTONIC) timestamps to wall
+// clock time using an offset measured once at attach time.
+type monoClock struct{ offset time.Duration }
+
+func newMonoClock() (monoClock, error) {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+		return monoClock{}, fmt.Errorf("reading monotonic clock: %w", err)
+	}
+	return monoClock{offset: time.Duration(time.Now().UnixNano() - ts.Nano())}, nil
+}
+
+func (c monoClock) wall(ktimeNs uint64) time.Time {
+	return time.Unix(0, int64(ktimeNs)+int64(c.offset)).UTC()
 }
 
 func cString(b []uint8) string {
